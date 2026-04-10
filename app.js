@@ -224,9 +224,9 @@ function classifyTrip(typeRaw) {
 // 엑셀 파싱
 // ================================================================
 
-/** 헤더 행 인덱스 자동 탐지 */
+/** 헤더 행 인덱스 자동 탐지. 못 찾으면 -1 반환 */
 function findHeaderRow(sheet) {
-  const keywords = ["성명", "이름", "날짜", "일자", "부서", "소속", "팀", "휴가관리", "시간외관리", "출장관리"];
+  const keywords = ["성명", "이름", "날짜", "일자", "부서", "소속", "팀", "휴가관리", "시간외관리", "출장관리", "시간외", "조퇴"];
   const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "", blankrows: false });
   const limit = Math.min(raw.length, 30);
   for (let i = 0; i < limit; i++) {
@@ -234,13 +234,23 @@ function findHeaderRow(sheet) {
     const hits  = keywords.filter((k) => cells.includes(k));
     if (hits.length >= 2 && (cells.includes("성명") || cells.includes("이름"))) return i;
   }
-  return 0;
+  return -1; // 헤더 없음
+}
+
+// 고정 컬럼 순서: A=날짜, B=부서, C=성명, D=출근, E=퇴근, F=출근여부, G=시간외, H=조퇴, I=휴가관리, J=출장관리, K=시간외관리
+function rawRowToObj(r) {
+  return {
+    "날짜": r[0], "부서": r[1], "성명": r[2],
+    "출근": r[3], "퇴근": r[4], "출근여부": r[5],
+    "시간외": r[6], "조퇴": r[7], "휴가관리": r[8],
+    "출장관리": r[9], "시간외관리": r[10],
+  };
 }
 
 /** 행(row 객체) → 근태 레코드[] */
 function parseRow(row, sheetName) {
   const name = String(row["성명"] ?? row["이름"] ?? "").trim();
-  if (!name) return [];
+  if (!name || name.toLowerCase() === "admin") return []; // admin 계정 제외
 
   const dept    = String(row["부서"] ?? row["소속"] ?? row["팀"] ?? "미지정").trim() || "미지정";
   const empId   = String(row["사원번호"] ?? row["사번"] ?? "-").trim() || "-";
@@ -248,8 +258,8 @@ function parseRow(row, sheetName) {
 
   const records = [];
 
-  // 시간외
-  const otHours = parseOvertimeCell(row["시간외관리"] ?? row["시간외(시간)"] ?? row["시간외"]);
+  // 시간외: G컬럼(숫자) 우선, 없으면 K컬럼(텍스트) 파싱
+  const otHours = parseOvertimeCell(row["시간외"] ?? row["시간외(시간)"] ?? row["시간외관리"]);
   if (otHours > 0) {
     records.push({ month: sheetName, dept, name, empId, date: dateStr, category: "시간외", subType: "시간외근무", tripType: "", overtimeHours: otHours, durationHours: 0, dedupeKey: "" });
   }
@@ -289,7 +299,17 @@ function parseWorkbook(buffer) {
   for (const sheetName of wb.SheetNames) {
     const sheet  = wb.Sheets[sheetName];
     const hdrRow = findHeaderRow(sheet);
-    const rows   = XLSX.utils.sheet_to_json(sheet, { defval: "", range: hdrRow });
+
+    let rows;
+    if (hdrRow >= 0) {
+      // 헤더 행 발견 → 컬럼명으로 파싱
+      rows = XLSX.utils.sheet_to_json(sheet, { defval: "", range: hdrRow });
+    } else {
+      // 헤더 없음 (3월 등) → 고정 컬럼 순서로 파싱
+      const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+      rows = rawRows.map(rawRowToObj);
+    }
+
     for (const row of rows) all.push(...parseRow(row, sheetName));
   }
 
