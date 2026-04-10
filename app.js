@@ -1,8 +1,7 @@
 // ================================================================
 // 설정
 // ================================================================
-const STORAGE_KEY = "근태대시보드_v1";
-const DRIVE_XLSX_URL = "https://docs.google.com/spreadsheets/d/1grIcwPHx4XanTASz9UGmANC8L6bNAIMdH5D2h6wP73Q/export?format=xlsx";
+const STORAGE_KEY   = "근태대시보드_v1";
 const HOURS_PER_DAY = 8;
 
 // ================================================================
@@ -571,49 +570,102 @@ function updateDashboard() {
 }
 
 // ================================================================
-// Google Drive 불러오기
+// 데이터 불러오기 — Google Visualization API 방식
+// (공개 시트 전용, CORS 제한 없음, 별도 인증 불필요)
 // ================================================================
 
-function makeFetchTargets(url) {
-  const id     = url.match(/\/d\/([^/?&]+)/)?.[1] || "";
-  const noProto = url.replace(/^https?:\/\//, "");
-  return [
-    { label: "google-direct",      url,                                                                          cred: true  },
-    { label: "google-authuser",    url: `${url}&authuser=0`,                                                     cred: true  },
-    { label: "google-alt",         url: id ? `https://docs.google.com/spreadsheets/d/${id}/export?format=xlsx` : url, cred: true },
-    { label: "corsproxy.io",       url: `https://corsproxy.io/?${encodeURIComponent(url)}`,                     cred: false },
-    { label: "allorigins",         url: `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,        cred: false },
-    { label: "cors.isomorphic-git", url: `https://cors.isomorphic-git.org/${noProto}`,                         cred: false },
-  ];
+const SHEET_ID    = "1grIcwPHx4XanTASz9UGmANC8L6bNAIMdH5D2h6wP73Q";
+const MONTH_NAMES = ["1월","2월","3월","4월","5월","6월","7월","8월","9월","10월","11월","12월"];
+
+/**
+ * Google Visualization API로 시트 1개 데이터를 2D 배열로 반환.
+ * headers=0 → 모든 행을 데이터로 취급 (헤더 자동감지는 우리가 직접 처리)
+ */
+async function fetchSheetGViz(sheetName) {
+  const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&headers=0&sheet=${encodeURIComponent(sheetName)}`;
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const text = await res.text();
+    // 응답 형식: google.visualization.Query.setResponse({...});
+    const match = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]+)\)/);
+    if (!match) return null;
+    const json = JSON.parse(match[1]);
+    if (json.status !== "ok" || !json.table) return null;
+    // 2D 배열로 변환
+    return json.table.rows.map((r) =>
+      (r.c || []).map((cell) => (cell ? (cell.v ?? cell.f ?? "") : ""))
+    );
+  } catch {
+    clearTimeout(timer);
+    return null;
+  }
 }
 
-async function fetchBuffer(url) {
-  const targets = makeFetchTargets(url);
-  const errors  = [];
+/**
+ * 2D 배열 → parseRow 객체 배열.
+ * 헤더 행이 있으면 컬럼명으로 매핑, 없으면 고정 컬럼 순서 사용.
+ */
+function parseGrid(grid, sheetName) {
+  if (!grid || !grid.length) return [];
+  const keywords = new Set(["성명","이름","날짜","부서","소속","팀","휴가관리","시간외관리","출장관리","시간외","조퇴"]);
 
-  for (const t of targets) {
-    try {
-      const ctrl  = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 15000);
-
-      const res = await fetch(t.url, {
-        signal:      ctrl.signal,
-        credentials: t.cred ? "include" : "omit",
-        cache:       "no-store",
-      });
-      clearTimeout(timer);
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const ct = res.headers.get("content-type") || "";
-      if (ct.includes("text/html")) throw new Error("HTML 응답 (로그인 페이지 또는 권한 오류)");
-
-      return await res.arrayBuffer();
-    } catch (e) {
-      errors.push(`[${t.label}] ${e.message}`);
+  // 헤더 행 탐색
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(grid.length, 30); i++) {
+    const cells = grid[i].map((v) => String(v ?? "").replace(/\s+/g, "").trim());
+    const hits  = cells.filter((c) => keywords.has(c));
+    if (hits.length >= 2 && (cells.includes("성명") || cells.includes("이름"))) {
+      headerIdx = i;
+      break;
     }
   }
 
-  throw new Error(`모든 경로에서 실패했습니다:\n${errors.join("\n")}`);
+  let rowObjs;
+  if (headerIdx >= 0) {
+    const headers = grid[headerIdx].map((v) => String(v ?? "").trim());
+    rowObjs = grid.slice(headerIdx + 1).map((r) => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = r[i] ?? ""; });
+      return obj;
+    });
+  } else {
+    // 헤더 없는 시트 (예: 3월) — 고정 컬럼 순서
+    rowObjs = grid.map(rawRowToObj);
+  }
+
+  const records = [];
+  for (const row of rowObjs) records.push(...parseRow(row, sheetName));
+  return records;
+}
+
+/** 모든 월 시트를 GViz로 로드 후 파싱 */
+async function loadViaGViz() {
+  const all    = [];
+  const months = [];
+
+  for (const sheetName of MONTH_NAMES) {
+    const grid = await fetchSheetGViz(sheetName);
+    if (!grid || !grid.length) continue;   // 해당 월 시트 없으면 스킵
+    months.push(sheetName);
+    all.push(...parseGrid(grid, sheetName));
+  }
+
+  if (!all.length) throw new Error("데이터를 가져오지 못했습니다.\n스프레드시트 공유 설정을 확인해주세요.");
+
+  const seen    = new Set();
+  const deduped = all.filter((r) => {
+    if (!r.dedupeKey) return true;
+    if (seen.has(r.dedupeKey)) return false;
+    seen.add(r.dedupeKey);
+    return true;
+  });
+
+  const departments = [...new Set(deduped.map((r) => r.dept).filter(Boolean))].sort((a, b) => a.localeCompare(b, "ko"));
+  return { records: deduped, months, departments };
 }
 
 async function loadFromDrive() {
@@ -621,12 +673,7 @@ async function loadFromDrive() {
   loadDriveBtn.textContent = "불러오는 중…";
 
   try {
-    const buffer = await fetchBuffer(DRIVE_XLSX_URL);
-    const parsed = parseWorkbook(buffer);
-
-    if (!parsed.records.length) {
-      throw new Error("파싱된 데이터가 0건입니다.\n엑셀 시트 컬럼명(날짜, 성명, 부서 등)을 확인해주세요.");
-    }
+    const parsed = await loadViaGViz();
 
     applyData(parsed);
     saveState();
@@ -642,7 +689,7 @@ async function loadFromDrive() {
 
     alert(`✅ 완료! 총 ${state.records.length}건 불러왔습니다.`);
   } catch (e) {
-    alert(`❌ 불러오기 실패\n\n${e.message}\n\n─────────────────\n※ 점검 사항\n1. 스프레드시트 공유: '링크가 있는 모든 사용자 - 뷰어'\n2. 크롬에 구글 계정으로 로그인된 상태인지 확인`);
+    alert(`❌ 불러오기 실패\n\n${e.message}`);
   } finally {
     loadDriveBtn.disabled    = false;
     loadDriveBtn.textContent = "최신 데이터 새로고침";
